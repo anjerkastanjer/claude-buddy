@@ -36,6 +36,38 @@ esac
 
 [ "$BUDDY_SHELL" = "1" ] && exit 0
 
+# `timeout` isn't part of macOS's default BSD userland -- it only exists there
+# via Homebrew coreutils, installed as `gtimeout` so it doesn't collide with
+# any system tool. Detect what's actually available; every subprocess call
+# below goes through _bt so it degrades to running unguarded rather than
+# failing outright on a platform that doesn't have either.
+#
+# Windows also ships its own native timeout.exe (System32), unrelated to GNU
+# coreutils and with completely different syntax (`/t <seconds>`, and it
+# never runs a trailing command at all). If PATH happens to resolve `timeout`
+# to that one instead of Git Bash's coreutils build, every _bt call below
+# would silently do nothing useful -- the very first jq read would come back
+# empty, and the script exits immediately at the empty-NAME guard, rendering
+# nothing. Confirm --version looks like GNU coreutils before trusting a match.
+_is_gnu_timeout() {
+    "$1" --version </dev/null 2>/dev/null | grep -qi "coreutils"
+}
+_TIMEOUT_BIN=""
+for _cand in timeout gtimeout; do
+    if command -v "$_cand" >/dev/null 2>&1 && _is_gnu_timeout "$_cand"; then
+        _TIMEOUT_BIN="$_cand"
+        break
+    fi
+done
+_bt() {
+    local secs="$1"; shift
+    if [ -n "$_TIMEOUT_BIN" ]; then
+        "$_TIMEOUT_BIN" "$secs" "$@"
+    else
+        "$@"
+    fi
+}
+
 # shellcheck source=../scripts/paths.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../scripts/paths.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/substatus.sh"
@@ -69,7 +101,7 @@ SID="$BUDDY_SID"
 # all) from an explicit 0, which means "no achievement pending" and must not
 # render.
 IFS=$'\x1f' read -r MUTED NAME RARITY STARS SHINY ACHIEVEMENT ACHIEVEMENT_AT LEVEL MOOD < <(
-    timeout 3 jq -r '
+    _bt 3 jq -r '
             def clean: gsub("[\n\u001f]"; " ");
             [(.muted // false), ((.name // "") | clean), (.rarity // "common"), ((.stars // "") | clean),
             (.shiny // false), ((.achievement // "") | clean),
@@ -90,7 +122,7 @@ NOW=${BUDDY_FAKE_NOW:-$(date +%s)}
 # ─── Rarity color (theme-aware) ─────────────────────────────────────────────
 _THEME="dark"
 if [ -f "$CONFIG_FILE" ]; then
-    _cfg_theme=$(timeout 3 jq -r '.theme // "auto"' "$CONFIG_FILE" 2>/dev/null)
+    _cfg_theme=$(_bt 3 jq -r '.theme // "auto"' "$CONFIG_FILE" 2>/dev/null)
     [ "$_cfg_theme" = "light" ] && _THEME="light"
 fi
 
@@ -130,7 +162,7 @@ RAINBOW=(
 )
 
 if [ -f "$CONFIG_FILE" ]; then
-    _custom=$(timeout 3 jq -r '(.rainbowColors // []) | @tsv' "$CONFIG_FILE" 2>/dev/null)
+    _custom=$(_bt 3 jq -r '(.rainbowColors // []) | @tsv' "$CONFIG_FILE" 2>/dev/null)
     if [ -n "$_custom" ]; then
         RAINBOW=()
         for _hex in $_custom; do
@@ -243,11 +275,24 @@ fi
 # fallback. One process for both dimensions instead of two — each PowerShell
 # spawn is a full host boot (~0.5-1s), not just an ordinary process spawn.
 if [ "${COLS:-0}" -lt 1 ] 2>/dev/null || [ "${ROWS:-0}" -lt 1 ] 2>/dev/null; then
-    _ps_dims=$(timeout 5 powershell.exe -NoProfile -Command "(Get-Host).UI.RawUI.WindowSize.Width; (Get-Host).UI.RawUI.WindowSize.Height" 2>/dev/null | tr -d '\r')
+    _ps_dims=$(_bt 5 powershell.exe -NoProfile -Command "(Get-Host).UI.RawUI.WindowSize.Width; (Get-Host).UI.RawUI.WindowSize.Height" 2>/dev/null | tr -d '\r')
     # Pure parameter expansion, not sed -- two more process spawns just to
     # split two lines would undercut the whole point of merging the calls.
-    _ps_cols="${_ps_dims%%$'\n'*}"
-    _ps_rows="${_ps_dims#*$'\n'}"
+    # Only trust the split when both lines actually came back: if PowerShell
+    # printed just the width (a truncated/partial call), `${_ps_dims#*$'\n'}`
+    # with no newline in the string returns the string unchanged, so a lone
+    # width would get read as _ps_rows too -- accepted by _is_positive_int
+    # and selecting the wrong density tier.
+    case "$_ps_dims" in
+        *$'\n'*)
+            _ps_cols="${_ps_dims%%$'\n'*}"
+            _ps_rows="${_ps_dims#*$'\n'}"
+            ;;
+        *)
+            _ps_cols=""
+            _ps_rows=""
+            ;;
+    esac
     if [ "${COLS:-0}" -lt 1 ] 2>/dev/null && _is_positive_int "$_ps_cols"; then
         [ "$_ps_cols" -gt 40 ] 2>/dev/null && COLS=$((10#$_ps_cols))
     fi
@@ -276,8 +321,10 @@ if [ -f "$CONFIG_FILE" ]; then
     # One jq process for all five fields instead of five — see the note by the
     # status.json read above on why per-call spawn cost matters here.
     IFS=$'\x1f' read -r _ttl _bw _bm _wa _density < <(
-        timeout 3 jq -r '[(.reactionTTL // 900), (.bubbleWidth // 44), (.bubbleMargin // 8),
-                (.statuslineWidthAdjust // 0), (.statuslineDensity // "auto")] | join("")' \
+        _bt 3 jq -r '
+                def clean: tostring | gsub("[\n\u001f]"; " ");
+                [((.reactionTTL // 900) | clean), ((.bubbleWidth // 44) | clean), ((.bubbleMargin // 8) | clean),
+                ((.statuslineWidthAdjust // 0) | clean), ((.statuslineDensity // "auto") | clean)] | join("")' \
             "$CONFIG_FILE" 2>/dev/null | tr -d '\r'
     )
     # Each field defaults independently below by simply not overwriting its
@@ -329,7 +376,7 @@ _sweep_expired_reactions() {
 
     for file in "$BUDDY_STATE_DIR"/reaction.*.json; do
         [ -f "$file" ] || continue
-        ts=$(timeout 3 jq -r '.timestamp // 0' "$file" 2>/dev/null || echo 0)
+        ts=$(_bt 3 jq -r '.timestamp // 0' "$file" 2>/dev/null || echo 0)
         case "$ts" in
             ''|*[!0-9]*) rm -f "$file" 2>/dev/null ;;
             *) [ "$ts" -le "$cutoff_ms" ] 2>/dev/null && rm -f "$file" 2>/dev/null ;;
@@ -375,7 +422,7 @@ fi
 # One jq process for reaction + timestamp instead of two (see the earlier
 # consolidation notes on why per-call spawn cost matters here).
 IFS=$'\x1f' read -r REACTION TS < <(
-    timeout 3 jq -r '[((.reaction // "") | gsub("[\n\u001f]"; " ")), (.timestamp // 0)] | join("")' "$REACTION_FILE" 2>/dev/null | tr -d '\r'
+    _bt 3 jq -r '[((.reaction // "") | gsub("[\n\u001f]"; " ")), (.timestamp // 0)] | join("")' "$REACTION_FILE" 2>/dev/null | tr -d '\r'
 )
 TS="${TS:-0}"
 if [ -n "$REACTION" ] && [ "$REACTION" != "null" ] && [ "$REACTION" != "" ]; then
@@ -402,13 +449,13 @@ fi
 
 # ─── Animation: pick current density frame from server-rendered frames ───────
 NOW=${BUDDY_FAKE_NOW:-$(date +%s)}
-FRAME_BODY=$(timeout 3 jq -r --argjson now "$NOW" --arg tier "$TIER" '
+FRAME_BODY=$(_bt 3 jq -r --argjson now "$NOW" --arg tier "$TIER" '
     .frameSequence[$now % (.frameSequence | length)] as $idx
     | if $tier == "compact" then ((.compactFrames? // .frames) | .[$idx] // .frames[$idx])
       elif $tier == "minimal" then ((.minimalFrames? // .frames) | .[$idx] // .frames[$idx])
       else .frames[$idx]
       end // ""
-' "$STATE" 2>/dev/null)
+' "$STATE" 2>/dev/null | tr -d '\r')
 
 # Fallback when status.json lacks .frames — e.g. server/bash version skew
 # during install or while the MCP server hasn't rewritten the file yet. Keep
@@ -490,6 +537,31 @@ EMOJI_PRES_2600="$(grep -v '^#' "$EMOJI_WIDTHS_DATA" 2>/dev/null | tr -d '\n')"
 EMOJI_TEXT_DATA="$(dirname "${BASH_SOURCE[0]}")/emoji-text.data"
 EMOJI_TEXT="$(grep -v '^#' "$EMOJI_TEXT_DATA" 2>/dev/null | tr -d '\n')"
 
+# iconv is not guaranteed to exist even where it always has before: it is
+# genuinely absent on this machine right now (only the libiconv DLL other
+# tools link against is installed, not the standalone binary) despite having
+# worked earlier in the same environment, so this is not a platform check to
+# skip -- it is a real, observed runtime gap. python3 (already a hard
+# dependency of the wider install, per README/cli/install.ts) reads the same
+# UTF-8 bytes and emits the same "one decimal codepoint per token" shape
+# `od -An -tu4` does, so the awk scripts below don't need to know which one
+# ran. Without this fallback, every non-ASCII value (rarity stars, mood/
+# achievement glyphs) silently gets zero width data and whatever depends on
+# it -- truncation, centering -- breaks for exactly the buddies (rare/epic/
+# legendary, i.e. the ones with stars) most likely to need it.
+command -v iconv >/dev/null 2>&1 && _HAS_ICONV=1 || _HAS_ICONV=0
+_utf8_codepoints() {
+    if [ "$_HAS_ICONV" -eq 1 ]; then
+        printf '%s' "$1" | iconv -f UTF-8 -t UTF-32LE 2>/dev/null | od -An -tu4
+    else
+        printf '%s' "$1" | python3 -c '
+import sys
+data = sys.stdin.buffer.read().decode("utf-8", "replace")
+print(" ".join(str(ord(c)) for c in data))
+' 2>/dev/null
+    fi
+}
+
 dwidth() {
     # Fast path: every ASCII codepoint is width 1 under char_width() below (none
     # of the wide/CJK/fullwidth/box-drawing ranges are in 0-127), so for ASCII-only
@@ -502,7 +574,7 @@ dwidth() {
         *[![:ascii:]]*) ;;
         *) printf '%s' "${#1}"; return ;;
     esac
-    printf '%s' "$1" | iconv -f UTF-8 -t UTF-32LE 2>/dev/null | od -An -tu4 | awk -v pres="$EMOJI_PRES_2600" -v text="$EMOJI_TEXT" '
+    _utf8_codepoints "$1" | awk -v pres="$EMOJI_PRES_2600" -v text="$EMOJI_TEXT" '
     function load_ranges(value, target,    n, i, count, piece, bounds, start, end, cp) {
         n = split(value, ranges, ",")
         for (i = 1; i <= n; i++) {
@@ -552,7 +624,7 @@ dwidth_profile() {
             return
             ;;
     esac
-    printf '%s' "$1" | iconv -f UTF-8 -t UTF-32LE 2>/dev/null | od -An -tu4 | awk -v pres="$EMOJI_PRES_2600" -v text="$EMOJI_TEXT" '
+    _utf8_codepoints "$1" | awk -v pres="$EMOJI_PRES_2600" -v text="$EMOJI_TEXT" '
     function load_ranges(value, target,    n, i, count, piece, bounds, start, end, cp) {
         n = split(value, ranges, ",")
         for (i = 1; i <= n; i++) {
